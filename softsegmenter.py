@@ -1,3 +1,5 @@
+# Copyright 2026 Peter Polák.
+
 # -*- coding: utf-8 -*-
 
 import logging
@@ -149,8 +151,10 @@ class YAALScorer:
             delays[0] >= recording_end
         ):
             return None
+        
+        assert source_length > 0, "Source length must be greater than 0."
 
-        LAAL = 0
+        YAAL = 0
         gamma = max(len(delays), target_length) / source_length
         tau = 0
         for t_minus_1, d in enumerate(delays):
@@ -158,11 +162,11 @@ class YAALScorer:
             if (d >= source_length and not is_longform) or (d >= recording_end):
                 break
 
-            LAAL += d - t_minus_1 / gamma
+            YAAL += d - t_minus_1 / gamma
             tau = t_minus_1 + 1
 
-        LAAL /= tau
-        return LAAL
+        YAAL /= tau
+        return YAAL
 
     def __call__(self, instances: Dict[int, Instance]) -> float:
         scores = []
@@ -180,8 +184,8 @@ class YAALScorer:
         return mean(scores) if len(scores) > 0 else float("nan")
 
 
-# enum for match deletion and insertion
-class Match:
+class AlignmentOperation:
+    """Enum for alignment operations."""
     MATCH = 0
     DELETE = 1
     INSERT = 2
@@ -189,6 +193,18 @@ class Match:
 
 
 class Word:
+    """
+    Represents a word with associated timing information.
+
+    Attributes:
+        text (str): The word text.
+        delay (float): The delay timestamp.
+        seq_id (Optional[int]): Sequence identifier for alignment.
+        elapsed (Optional[float]): Elapsed time (for computation-aware delays).
+        main (bool): Whether this is a main word (not a subtoken).
+        original (Optional[str]): The original word before tokenization.
+        recording_length (Optional[float]): Total recording length.
+    """
     def __init__(
         self,
         text,
@@ -214,23 +230,41 @@ class Word:
 
 def align_sequences(seq1, seq2, metric, char_level):
     """
-    Align two sequences maximizing the given metric.
+    Align two sequences maximizing the similarity metric.
+
+    This function implements a dynamic programming algorithm similar to
+    Needleman-Wunsch, but with a custom similarity score and no gap penalties.
+    It is also similar to Dynamic Time Warping (DTW) but there is no penalty
+    for leading/trailing gaps. The algorithm allows for insertions and
+    deletions without penalty, but matches are scored based on the Jaccard
+    similarity of character sets (or exact match for character-level).
+    The alignment is computed to maximize the total similarity score across
+    the aligned sequences.
+
+    Args:
+        seq1 (List[Word]): First sequence (typically reference).
+        seq2 (List[Word]): Second sequence (typically hypothesis).
+        metric (callable): Similarity function taking (ref_word, hyp_word, char_level).
+        char_level (bool): Whether to use character-level comparison.
+
+    Returns:
+        tuple: Two aligned sequences with None for gaps.
     """
     # Initialize the alignment matrix
     n = len(seq1) + 1
     m = len(seq2) + 1
     dp = [[0] * m for _ in range(n)]
-    dp_back = [[Match.NONE] * m for _ in range(n)]
+    dp_back = [[AlignmentOperation.NONE] * m for _ in range(n)]
 
     # Fill the first row and column of the matrix
     for i in range(n):
         dp[i][0] = 0
-        dp_back[i][0] = Match.DELETE
+        dp_back[i][0] = AlignmentOperation.DELETE
     for j in range(m):
         dp[0][j] = 0
-        dp_back[0][j] = Match.INSERT
+        dp_back[0][j] = AlignmentOperation.INSERT
     dp[0][0] = 0
-    dp_back[0][0] = Match.MATCH
+    dp_back[0][0] = AlignmentOperation.MATCH
     # Fill the alignment matrix
     for i in range(1, n):
         for j in range(1, m):
@@ -239,27 +273,27 @@ def align_sequences(seq1, seq2, metric, char_level):
             insert = dp[i][j - 1]
             dp[i][j] = max(match, delete, insert)
             if dp[i][j] == match:
-                dp_back[i][j] = Match.MATCH
+                dp_back[i][j] = AlignmentOperation.MATCH
             elif dp[i][j] == delete:
-                dp_back[i][j] = Match.DELETE
+                dp_back[i][j] = AlignmentOperation.DELETE
             else:
-                dp_back[i][j] = Match.INSERT
+                dp_back[i][j] = AlignmentOperation.INSERT
 
     # Backtrack to find the alignment
     aligned_seq1 = []
     aligned_seq2 = []
     i, j = n - 1, m - 1
     while i > 0 or j > 0:
-        if dp_back[i][j] == Match.MATCH:
+        if dp_back[i][j] == AlignmentOperation.MATCH:
             aligned_seq1.append(seq1[i - 1])
             aligned_seq2.append(seq2[j - 1])
             i -= 1
             j -= 1
-        elif dp_back[i][j] == Match.DELETE:
+        elif dp_back[i][j] == AlignmentOperation.DELETE:
             aligned_seq1.append(seq1[i - 1])
             aligned_seq2.append(None)
             i -= 1
-        elif dp_back[i][j] == Match.INSERT:
+        elif dp_back[i][j] == AlignmentOperation.INSERT:
             aligned_seq1.append(None)
             aligned_seq2.append(seq2[j - 1])
             j -= 1
@@ -270,15 +304,35 @@ def align_sequences(seq1, seq2, metric, char_level):
     return aligned_seq1, aligned_seq2
 
 
-def load_reference(yaml_file, ref_sentences_file, char_level, offset_delays):
+def load_reference(reference_segmentation, ref_sentences_file, char_level, offset_delays):
     """
     Prepare the reference sentences for alignment.
+
+    Loads segmentation info from a YAML or JSON file and reference sentences from a text file,
+    then converts them into lists of Word objects with sequence IDs.
+
+    Args:
+        reference_segmentation (str): Path to the YAML or JSON file with reference speech segmentation.
+        ref_sentences_file (str): Path to the reference sentences file.
+        char_level (bool): Whether to use character-level units.
+        offset_delays (bool): Whether to offset delays relative to the first segment.
+
+    Returns:
+        tuple: (words, segmentation, reference_sentences) where words is a list of
+            lists of Word objects grouped by recording, segmentation is the parsed
+            YAML or JSON data, and reference_sentences is the list of reference strings.
     """
-    with open(yaml_file, "r", encoding="utf-8") as file:
-        segmentation = yaml.load(file, Loader=yaml.CLoader)
-        for seg in segmentation:
-            seg["duration"] = seg["duration"] * 1000  # Convert to milliseconds
-            seg["offset"] = seg["offset"] * 1000  # Convert to milliseconds
+    if reference_segmentation.endswith(".json"):
+        with open(reference_segmentation, "r", encoding="utf-8") as file:
+            segmentation = json.load(file)
+    elif reference_segmentation.endswith(".yaml") or reference_segmentation.endswith(".yml"):
+        with open(reference_segmentation, "r", encoding="utf-8") as file:
+            segmentation = yaml.load(file, Loader=yaml.CLoader)
+    else:
+        raise ValueError("Unsupported segmentation file format. Use YAML or JSON.")
+    for seg in segmentation:
+        seg["duration"] = seg["duration"] * 1000  # Convert to milliseconds
+        seg["offset"] = seg["offset"] * 1000  # Convert to milliseconds
 
     with open(ref_sentences_file, "r", encoding="utf-8") as file:
         reference_sentences = file.readlines()
@@ -313,6 +367,15 @@ def load_reference(yaml_file, ref_sentences_file, char_level, offset_delays):
 
 
 def get_segmentation_order(segmentation):
+    """
+    Extract the unique ordering of audio files from the segmentation.
+
+    Args:
+        segmentation (list): Parsed segmentation data from YAML or JSON.
+
+    Returns:
+        list: Ordered list of unique audio file names.
+    """
     segmentation_order = []
     for segment in segmentation:
         if len(segmentation_order) == 0 or segmentation_order[-1] != segment["wav"]:
@@ -349,9 +412,20 @@ def normalize_unicode(text):
     return unicodedata.normalize("NFKC", text)
 
 
-def load_hypothesis(hypothesis_file, char_level, segmentation_order):
+def load_hypothesis(hypothesis_file, char_level, segmentation_order, fix_elapsed_flag):
     """
     Load the hypothesis sentences for alignment.
+
+    Reads hypothesis outputs from a JSONL file and converts them into lists of
+    Word objects with delay and elapsed timing information.
+
+    Args:
+        hypothesis_file (str): Path to the hypothesis JSONL file.
+        char_level (bool): Whether to use character-level units.
+        segmentation_order (list): Ordered list of audio file names for alignment.
+
+    Returns:
+        List[List[Word]]: List of lists of Word objects, one per recording.
     """
     hypotheses = {}
     source_lengths = {}
@@ -378,14 +452,16 @@ def load_hypothesis(hypothesis_file, char_level, segmentation_order):
     assert len(hypotheses) == len(
         source_lengths
     ), "Number of hypotheses and source lengths do not match."
-
     words = []
+    all_have_elapsed = all("elapsed" in h for h in hypotheses)
     for i, (h, l) in enumerate(zip(hypotheses, source_lengths)):
         prediction = normalize_unicode(h["prediction"])
         units = list(prediction) if char_level else prediction.split()
         assert len(units) == len(
             h["delays"]
         ), f"Number of units and delays do not match for hypothesis {i}: {len(units)} vs {len(h['delays'])}"
+        if "elapsed" not in h:
+            h["elapsed"] = list(h["delays"])
         assert len(units) == len(
             h["elapsed"]
         ), f"Number of units and elapsed times do not match for hypothesis {i}: {len(units)} vs {len(h['elapsed'])}"
@@ -394,13 +470,28 @@ def load_hypothesis(hypothesis_file, char_level, segmentation_order):
             instance_words.append(
                 Word(unit, delay, elapsed=elapsed, recording_length=l)
             )
-        words.append(fix_elapsed(instance_words))
-    return words
+        if fix_elapsed_flag:
+            instance_words = fix_elapsed(instance_words)
+        words.append(instance_words)
+    return words, all_have_elapsed
 
 
 def process_alignment(ref_words, hyp_words, metric, char_level):
     """
-    Process the alignment of reference and hypothesis words.
+    Process the alignment to assign sequence IDs to hypothesis words.
+
+    After alignment, hypothesis words that were aligned to gaps (None in the
+    reference) are re-assigned to the nearest reference segment based on
+    similarity scores.
+
+    Args:
+        ref_words (List[Optional[Word]]): Aligned reference words (with None for gaps).
+        hyp_words (List[Optional[Word]]): Aligned hypothesis words (with None for gaps).
+        metric (callable): Similarity function taking (ref_word, hyp_word, char_level).
+        char_level (bool): Whether using character-level alignment.
+
+    Returns:
+        List[Word]: Processed hypothesis words with assigned sequence IDs.
     """
     assert len(ref_words) == len(
         hyp_words
@@ -464,7 +555,20 @@ def calculate_mwer(ref_words, hyp_words):
 
 
 def metric(ref_word, hyp_word, char_level):
+    """
+    Compute the similarity metric between two words based on Jaccard similarity of
+    character sets (or exact match for character-level). Additionally, if one word
+    (or character) is punctuation and the other is not, return a negative score to
+    discourage alignment of punctuation with non-punctuation.
 
+    Args:
+        ref_word (Word): Reference word.
+        hyp_word (Word): Hypothesis word.
+        char_level (bool): Whether to use character-level comparison.
+
+    Returns:
+        float: Similarity score between the words.
+    """
     ref_text = ref_word.text
     hyp_text = hyp_word.text
 
@@ -487,6 +591,15 @@ def metric(ref_word, hyp_word, char_level):
 
 
 def process_audio(args):
+    """
+    Process alignment for a single audio recording. Top-level function for multiprocessing.
+
+    Args:
+        args: Tuple of (sample_index, ref_words, hyp_words, char_level).
+
+    Returns:
+        List[Word]: Processed hypothesis words with assigned sequence IDs.
+    """
     i, ref, hyp, char_level = args
     aligned_ref, aligned_hyp = align_sequences(ref, hyp, metric, char_level)
     mwer = calculate_mwer(aligned_ref, aligned_hyp)
@@ -495,6 +608,21 @@ def process_audio(args):
 
 
 def align_words(ref_words, hyp_words, char_level):
+    """
+    Align all hypothesis words to reference words across all recordings.
+
+    Runs alignment in parallel using multiprocessing and groups the resulting
+    hypothesis words by their assigned reference sequence IDs.
+
+    Args:
+        ref_words (List[List[Word]]): Reference words grouped by recording.
+        hyp_words (List[List[Word]]): Hypothesis words grouped by recording.
+        char_level (bool): Whether to use character-level alignment.
+
+    Returns:
+        Dict[int, List[Word]]: Mapping from reference sequence ID to aligned
+            hypothesis words.
+    """
     assert len(ref_words) == len(
         hyp_words
     ), f"Number of reference and hypothesis audios do not match: {len(ref_words)} vs {len(hyp_words)}"
@@ -526,12 +654,24 @@ def align_words(ref_words, hyp_words, char_level):
 
 
 def unicode_normalize(text):
+    """Normalize Unicode text to NFKC form."""
     return unicodedata.normalize("NFKC", text)
 
 
 def tokenize_words(words, lang):
     """
     Tokenize words using Moses tokenizer.
+
+    For Chinese and Japanese (or when lang is None), no tokenization is applied.
+    Otherwise, the Moses tokenizer is used to split words into subtokens.
+
+    Args:
+        words (List[List[Word]]): List of lists of words grouped by recording.
+        lang (Optional[str]): Language code for Moses tokenizer (e.g., 'en', 'de').
+            Use None, 'zh', or 'ja' to skip tokenization.
+
+    Returns:
+        List[List[Word]]: Tokenized words with subtokens marked (main=False).
     """
     if lang is None or lang == "zh" or lang == "ja":
         # For Chinese and Japanese, we don't need to tokenize
@@ -562,14 +702,35 @@ def tokenize_words(words, lang):
 
 
 def evaluate_instances(
-    resegmented_instances: List[Instance], tokenizer: str
+    resegmented_instances: List[Instance], tokenizer: str, fix_elapsed_flag: bool, all_have_elapsed: bool
 ) -> Dict[str, float]:
+    """
+    Evaluate resegmented instances using YAAL (computation-aware and unaware) and BLEU metrics.
+
+    Args:
+        resegmented_instances (List[Instance]): List of resegmented instances.
+        tokenizer (str): Tokenizer type for SacreBLEU (e.g., '13a').
+        fix_elapsed_flag (bool): Whether to fix elapsed times for computation-aware YAAL.
+        all_have_elapsed (bool): Whether all instances have elapsed time information.
+    Returns:
+        Dict[str, float]: Dictionary with 'ca_unaware_yaal', 'ca_aware_yaal', and 'bleu' scores.
+    """
     ca_unaware_yaal_scorer = YAALScorer(is_longform=True)
     ca_aware_yaal_scorer = YAALScorer(computation_aware=True, is_longform=True)
     bleu_scorer = SacreBLEUScorer(tokenizer)
     resegmented_instances_dict = {i: ins for i, ins in enumerate(resegmented_instances)}
     ca_unaware_yaal_score = ca_unaware_yaal_scorer(resegmented_instances_dict)
-    ca_aware_yaal_score = ca_aware_yaal_scorer(resegmented_instances_dict)
+
+    if all_have_elapsed:
+        ca_aware_yaal_score = ca_aware_yaal_scorer(resegmented_instances_dict)
+        if not fix_elapsed_flag:
+            if ca_aware_yaal_score - ca_unaware_yaal_score > 2000:
+                logger.warning(
+                    f"Computation-aware YAAL score {ca_aware_yaal_score} is significantly higher than computation-unaware YAAL score {ca_unaware_yaal_score}. Consider fixing elapsed times with --fix_elapsed flag."
+                )
+    else:
+        ca_aware_yaal_score = float("nan")
+        logger.warning("Not all instances have elapsed time information. Computation-aware YAAL score will be set to NaN.")
     bleu_score = bleu_scorer(resegmented_instances_dict)
     return {
         "ca_unaware_yaal": ca_unaware_yaal_score,
@@ -579,7 +740,7 @@ def evaluate_instances(
 
 
 def resegment(
-    yaml_file,
+    reference_segmentation,
     ref_sentences_file,
     hypothesis_file,
     char_level,
@@ -587,14 +748,34 @@ def resegment(
     output_folder,
     bleu_tokenizer,
     offset_delays,
+    fix_elapsed_flag,
 ):
+    """
+    Main resegmentation pipeline: load data, align, resegment, and evaluate.
+
+    Applies the SoftSegmenter alignment algorithm from
+    `"Better Late Than Never: Evaluation of Latency Metrics for Simultaneous Speech-to-Text
+    Translation" <https://arxiv.org/abs/2509.17349>`_ to align hypothesis outputs with
+    reference segments, then evaluates using YAAL and BLEU metrics.
+
+    Args:
+        reference_segmentation (str): Path to the YAML or JSON file with reference speech segmentation.
+        ref_sentences_file (str): Path to the reference sentences file.
+        hypothesis_file (str): Path to the hypothesis JSONL file.
+        char_level (bool): Whether to use character-level units.
+        lang (Optional[str]): Language code for Moses tokenizer.
+        output_folder (str): Path to the output directory.
+        bleu_tokenizer (str): Tokenizer type for SacreBLEU.
+        offset_delays (bool): Whether to offset delays relative to the first segment.
+        fix_elapsed_flag (bool): Whether to fix elapsed times for computation-aware YAAL.
+    """
     # Load reference and hypothesis sentences
     ref_words, segmentation, ref_sentences = load_reference(
-        yaml_file, ref_sentences_file, char_level, offset_delays
+        reference_segmentation, ref_sentences_file, char_level, offset_delays
     )
     ref_words = tokenize_words(ref_words, lang)
     segmentation_order = get_segmentation_order(segmentation)
-    hyp_words = load_hypothesis(hypothesis_file, char_level, segmentation_order)
+    hyp_words, all_have_elapsed = load_hypothesis(hypothesis_file, char_level, segmentation_order, fix_elapsed_flag)
     hyp_words = tokenize_words(hyp_words, lang)
 
     # Align words
@@ -640,7 +821,7 @@ def resegment(
         file.write(json.dumps(instances_dict, ensure_ascii=False, indent=2) + "\n")
 
     # Calculate metrics
-    scores = evaluate_instances(instances, bleu_tokenizer)
+    scores = evaluate_instances(instances, bleu_tokenizer, fix_elapsed_flag, all_have_elapsed)
     with open(
         os.path.join(output_folder, "scores.resegmented.csv"), "w", encoding="utf-8"
     ) as file:
@@ -652,7 +833,11 @@ if __name__ == "__main__":
 
     parser = ArgumentParser(description="Better MWER Segmenter")
     parser.add_argument(
-        "--yaml_file", type=str, required=True, help="Path to the YAML file."
+        "--speech_segmentation", type=str, required=True, 
+        help=(
+            "Path to the YAML or JSON file with speech segmentation. "
+            "The file should contain a list of segments with 'wav', 'offset', and 'duration' fields."
+        )
     )
     parser.add_argument(
         "--ref_sentences_file",
@@ -679,14 +864,31 @@ if __name__ == "__main__":
         help="Output file for new segmentation.",
     )
     parser.add_argument(
-        "--bleu_tokenizer", type=str, default="13a", help="Tokenizer for BLEU scorer."
+        "--bleu_tokenizer", type=str, default="13a", help="Tokenizer for the SacreBLEU scorer."
     )
     parser.add_argument(
-        "--offset_delays", action="store_true", help="Use offset delays."
+        "--offset_delays", action="store_true",
+        help=(
+            "Offset delays relative to the first segment. "
+            "This is useful when the delays in the hypothesis are relative to the start of the first segment, "
+            "but we want to align them to the recorging. This is useful when you reconcatenate the segments "
+            "and want to ensure that the delays are relative to the recording rather than the start of the "
+            "first segment."
+        )
+    )
+    parser.add_argument(
+        "--fix_elapsed", action="store_true",
+        help=(
+            "Fix elapsed times for computation-aware YAAL."
+            "SimulEval computes elapsed times as ELAPSED_i = DELAY_i + TOTAL_RUNTIME_i, "
+            "but we need to compute it as NEW_ELAPSED_i = DELAY_i + TOTAL_RUNTIME_i - TOTAL_RUNTIME_{i-1} "
+            "to ensure that the elapsed time of each word is relative to the previous word rather than the "
+            "start of the recording."
+        )
     )
     args = parser.parse_args()
     resegment(
-        args.yaml_file,
+        args.speech_segmentation,
         args.ref_sentences_file,
         args.hypothesis_file,
         args.char_level,
@@ -694,4 +896,5 @@ if __name__ == "__main__":
         args.output_folder,
         args.bleu_tokenizer,
         args.offset_delays,
+        args.fix_elapsed,
     )
