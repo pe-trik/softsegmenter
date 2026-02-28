@@ -1,5 +1,11 @@
 # SoftSegmenter
 
+## ⚠️ Deprecation Notice
+
+**This repository is no longer maintained.** The SoftSegmenter has been moved and significantly extended as part of [OmniSTEval](https://github.com/pe-trik/OmniSTEval). Please use that repository instead.
+
+---
+
 A tool for re-segmenting long-form simultaneous speech translation outputs to match reference segmentation, enabling segment-level quality (BLEU) and latency (YAAL) evaluation.
 
 Implements the SoftSegmenter alignment algorithm from [*Better Late Than Never: Evaluation of Latency Metrics for Simultaneous Speech-to-Text Translation*](https://arxiv.org/abs/2509.17349).
